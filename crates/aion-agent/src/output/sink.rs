@@ -1,3 +1,24 @@
+/// Token usage of one completed LLM call, with the context occupancy it leaves behind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallUsage {
+    /// Provider input of this call, including cache-read and cache-creation tokens.
+    pub input_tokens: u64,
+    /// Provider output of this call.
+    pub output_tokens: u64,
+    /// Subset of `input_tokens` used to create a provider-side prompt cache.
+    pub cache_creation_tokens: u64,
+    /// Subset of `input_tokens` read from a provider-side prompt cache.
+    pub cache_read_tokens: u64,
+    /// Best-known context occupancy after this call.
+    pub context_usage: u64,
+    /// Whether `context_usage` is the provider's exact report rather than a local estimate.
+    pub context_provider_reported: bool,
+    /// Configured context window of the model.
+    pub context_window: u64,
+    /// Wall time from sending the request until the response stream ended.
+    pub duration_ms: u64,
+}
+
 /// Abstraction over output channels (terminal vs JSON stream protocol)
 pub trait OutputSink: Send + Sync {
     /// Stream text delta from LLM
@@ -31,4 +52,9 @@ pub trait OutputSink: Send + Sync {
 
     /// Display informational message
     fn emit_info(&self, msg: &str);
+
+    /// Report the usage of one completed LLM call. A turn with tool use makes several
+    /// calls, each reported here; `emit_stream_end` still carries the turn totals.
+    /// Optional: the default ignores it.
+    fn emit_usage(&self, _usage: &CallUsage) {}
 }

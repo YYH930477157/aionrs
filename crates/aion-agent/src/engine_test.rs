@@ -606,8 +606,9 @@ mod tests_compact {
     use crate::compact::state::CompactState;
     use crate::confirm::ToolConfirmer;
     use crate::context_usage::{ContextState, ContextUsageSource};
-    use crate::output::OutputSink;
+    use crate::output::{CallUsage, OutputSink};
     use crate::session::{Session, SessionManager};
+    use crate::turn::TurnKind;
 
     struct NullOutput;
     impl OutputSink for NullOutput {
@@ -626,6 +627,7 @@ mod tests_compact {
         tool_results: Mutex<Vec<(String, String, bool, String)>>,
         errors: Mutex<Vec<String>>,
         infos: Mutex<Vec<String>>,
+        usages: Mutex<Vec<CallUsage>>,
     }
 
     impl OutputSink for RecordingOutput {
@@ -649,6 +651,10 @@ mod tests_compact {
 
         fn emit_info(&self, msg: &str) {
             self.infos.lock().unwrap().push(msg.to_string());
+        }
+
+        fn emit_usage(&self, usage: &CallUsage) {
+            self.usages.lock().unwrap().push(*usage);
         }
     }
 
@@ -1286,6 +1292,62 @@ mod tests_compact {
             engine.compact_state.last_input_tokens,
             engine.context_state.context_usage
         );
+    }
+
+    // -- Each LLM call reports its own usage and the context it leaves --
+
+    #[tokio::test]
+    async fn each_call_reports_its_usage_and_the_resulting_context() {
+        let output = Arc::new(RecordingOutput::default());
+        let config = CompactConfig {
+            context_window: 200_000,
+            ..Default::default()
+        };
+        let mut engine = make_compact_engine_with_output(config, CompactState::new(), vec![], output.clone());
+        engine.provider = Arc::new(SuccessfulProvider {
+            usage: TokenUsage {
+                input_tokens: 1200,
+                output_tokens: 300,
+                cache_creation_tokens: 100,
+                cache_read_tokens: 800,
+            },
+        });
+
+        engine.run_turn(TurnKind::Normal).await.unwrap();
+
+        let usages = output.usages.lock().unwrap().clone();
+        assert_eq!(usages.len(), 1);
+        let usage = usages[0];
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_tokens,
+                usage.cache_read_tokens
+            ),
+            (1200, 300, 100, 800)
+        );
+        assert_eq!(usage.context_usage, 1500, "provider input plus output");
+        assert!(usage.context_provider_reported);
+        assert_eq!(usage.context_window, 200_000);
+    }
+
+    #[tokio::test]
+    async fn a_call_without_provider_usage_reports_the_local_estimate() {
+        let output = Arc::new(RecordingOutput::default());
+        let mut engine =
+            make_compact_engine_with_output(CompactConfig::default(), CompactState::new(), vec![], output.clone());
+        engine.provider = Arc::new(SuccessfulProvider {
+            usage: TokenUsage::default(),
+        });
+
+        engine.run_turn(TurnKind::Normal).await.unwrap();
+
+        let usage = output.usages.lock().unwrap()[0];
+        assert_eq!((usage.input_tokens, usage.output_tokens), (0, 0));
+        assert!(!usage.context_provider_reported);
+        assert_eq!(usage.context_usage, engine.context_state.context_usage);
+        assert!(usage.context_usage > 0, "the reply text is still estimated");
     }
 
     // -- Disabled config skips micro and auto but not emergency --

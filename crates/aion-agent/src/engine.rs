@@ -12,12 +12,12 @@ use crate::compact::micro::{microcompact, should_microcompact};
 use crate::compact::state::CompactState;
 use crate::confirm::ToolConfirmer;
 use crate::context_usage::{
-    ContextState, ContextStatus, PromptUsage, estimate_content_tokens, estimate_messages_tokens, estimate_text_tokens,
-    estimate_tool_definitions_tokens,
+    ContextState, ContextStatus, ContextUsageSource, PromptUsage, estimate_content_tokens, estimate_messages_tokens,
+    estimate_text_tokens, estimate_tool_definitions_tokens,
 };
 use crate::error::AgentError;
 use crate::orchestration::{ExecutionControl, execute_tool_calls, execute_tool_calls_with_approval};
-use crate::output::OutputSink;
+use crate::output::{CallUsage, OutputSink};
 use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
 use crate::session::{Session, SessionManager};
@@ -882,13 +882,16 @@ impl AgentEngine {
             // autocompact nor emergency will fire.
             self.run_compaction().await?;
             let request = self.build_request(kind);
+            let started = std::time::Instant::now();
             let mut rx = self.provider.stream(&request).await?;
             let outcome = self.consume_stream(&mut rx).await?;
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let has_provider_usage = self.record_turn_usage(&outcome.usage);
             if !has_provider_usage {
                 let assistant_content = build_assistant_content(&outcome);
                 self.record_local_context_addition(estimate_content_tokens(&assistant_content));
             }
+            self.emit_call_usage(&outcome.usage, duration_ms);
             Ok(outcome)
         }
         .instrument(span)
@@ -1068,6 +1071,21 @@ impl AgentEngine {
             }
         }
         true
+    }
+
+    /// Report one completed call with the context occupancy it leaves behind,
+    /// after `record_turn_usage` has folded it in.
+    fn emit_call_usage(&self, usage: &TokenUsage, duration_ms: u64) {
+        self.output.emit_usage(&CallUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            context_usage: self.context_state.context_usage,
+            context_provider_reported: self.context_state.source == ContextUsageSource::ProviderExact,
+            context_window: self.compact_config.context_window as u64,
+            duration_ms,
+        });
     }
 
     /// Add content produced after the provider usage snapshot. Every final
