@@ -5058,6 +5058,7 @@ dependencies = [
  "memchr",
  "mio",
  "num-traits",
+ "once_cell",
  "percent-encoding",
  "proc-macro2",
  "quote",

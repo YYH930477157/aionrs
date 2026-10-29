@@ -26,6 +26,7 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "server"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
+once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
