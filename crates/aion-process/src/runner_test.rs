@@ -8,16 +8,25 @@ mod tests {
 
     use super::CommandRunner;
 
+    // PowerShell can take several seconds to start on a busy Windows host.
+    // Keep the command asleep beyond this budget so timeout behavior is tested
+    // after the output marker is emitted, rather than during shell startup.
+    const OUTPUT_TIMEOUT: Duration = if cfg!(windows) {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_millis(1500)
+    };
+
     #[tokio::test]
     async fn runner_preserves_stdout_emitted_before_timeout() {
         #[cfg(windows)]
-        let script = "Write-Output runner_stdout_before_timeout; Start-Sleep -Seconds 5";
+        let script = "Write-Output runner_stdout_before_timeout; Start-Sleep -Seconds 30";
         #[cfg(not(windows))]
         let script = "printf 'runner_stdout_before_timeout\n'; sleep 5";
 
         let command = shell_command(script);
         let result = CommandRunner::new(command)
-            .timeout(Duration::from_millis(1500))
+            .timeout(OUTPUT_TIMEOUT)
             .run()
             .await
             .expect("runner should return timeout result");
@@ -34,13 +43,13 @@ mod tests {
     #[tokio::test]
     async fn runner_preserves_stderr_emitted_before_timeout() {
         #[cfg(windows)]
-        let script = "Write-Error runner_stderr_before_timeout; Start-Sleep -Seconds 5";
+        let script = "Write-Error runner_stderr_before_timeout; Start-Sleep -Seconds 30";
         #[cfg(not(windows))]
         let script = "printf 'runner_stderr_before_timeout\n' >&2; sleep 5";
 
         let command = shell_command(script);
         let result = CommandRunner::new(command)
-            .timeout(Duration::from_millis(1500))
+            .timeout(OUTPUT_TIMEOUT)
             .run()
             .await
             .expect("runner should return timeout result");
@@ -125,9 +134,9 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn runner_timeout_kills_windows_job_descendant() {
-        let script = "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 10' -PassThru -WindowStyle Hidden; Write-Output $p.Id; Wait-Process -Id $p.Id";
+        let script = "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 30' -PassThru -WindowStyle Hidden; Write-Output $p.Id; Wait-Process -Id $p.Id";
         let result = CommandRunner::new(shell_command(script))
-            .timeout(Duration::from_millis(5000))
+            .timeout(OUTPUT_TIMEOUT)
             .post_process_drain(Duration::from_millis(250))
             .run()
             .await
@@ -244,7 +253,9 @@ mod tests {
 
     #[cfg(windows)]
     async fn assert_process_exits(pid: u32) {
-        for _ in 0..20 {
+        // Job termination is asynchronous; allow scheduling under load while
+        // staying well below the child's natural 30-second lifetime.
+        for _ in 0..100 {
             if !process_alive(pid) {
                 return;
             }

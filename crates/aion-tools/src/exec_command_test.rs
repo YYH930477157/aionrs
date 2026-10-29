@@ -52,6 +52,10 @@ async fn workspace_windows_partial_absolute_paths_are_rejected() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Account for PowerShell startup on loaded Windows machines. Commands stay
+    // asleep for 30 seconds, so the timeout must still interrupt them.
+    const OUTPUT_TIMEOUT_MS: u64 = if cfg!(windows) { 10_000 } else { 1500 };
     use serde_json::json;
 
     #[tokio::test]
@@ -112,19 +116,21 @@ mod tests {
     async fn execute_timeout_preserves_stdout_emitted_before_timeout() {
         let tool = ExecCommandTool::new(std::env::temp_dir());
         #[cfg(windows)]
-        let cmd = "Write-Output aion_stdout_before_timeout; Start-Sleep -Seconds 5";
+        let cmd = "Write-Output aion_stdout_before_timeout; Start-Sleep -Seconds 30";
         #[cfg(not(windows))]
         let cmd = "printf 'aion_stdout_before_timeout\\n'; sleep 5";
         let input = json!({
             "cmd": cmd,
-            "timeout": 1500
+            "timeout": OUTPUT_TIMEOUT_MS
         });
 
         let result = tool.execute(input).await;
 
         assert!(result.is_error, "timeout should be an error: {}", result.content);
         assert!(
-            result.content.contains("Command timed out after 1500ms"),
+            result
+                .content
+                .contains(&format!("Command timed out after {OUTPUT_TIMEOUT_MS}ms")),
             "timeout message missing: {}",
             result.content
         );
@@ -139,19 +145,21 @@ mod tests {
     async fn execute_timeout_preserves_stderr_emitted_before_timeout() {
         let tool = ExecCommandTool::new(std::env::temp_dir());
         #[cfg(windows)]
-        let cmd = "[Console]::Error.WriteLine('aion_stderr_before_timeout'); Start-Sleep -Seconds 5";
+        let cmd = "[Console]::Error.WriteLine('aion_stderr_before_timeout'); Start-Sleep -Seconds 30";
         #[cfg(not(windows))]
         let cmd = "printf 'aion_stderr_before_timeout\\n' >&2; sleep 5";
         let input = json!({
             "cmd": cmd,
-            "timeout": 1500
+            "timeout": OUTPUT_TIMEOUT_MS
         });
 
         let result = tool.execute(input).await;
 
         assert!(result.is_error, "timeout should be an error: {}", result.content);
         assert!(
-            result.content.contains("Command timed out after 1500ms"),
+            result
+                .content
+                .contains(&format!("Command timed out after {OUTPUT_TIMEOUT_MS}ms")),
             "timeout message missing: {}",
             result.content
         );
@@ -166,19 +174,21 @@ mod tests {
     async fn execute_timeout_omits_output_after_timeout() {
         let tool = ExecCommandTool::new(std::env::temp_dir());
         #[cfg(windows)]
-        let cmd = "Write-Output aion_before_timeout; Start-Sleep -Seconds 5; Write-Output aion_after_timeout";
+        let cmd = "Write-Output aion_before_timeout; Start-Sleep -Seconds 30; Write-Output aion_after_timeout";
         #[cfg(not(windows))]
         let cmd = "printf 'aion_before_timeout\\n'; sleep 5; printf 'aion_after_timeout\\n'";
         let input = json!({
             "cmd": cmd,
-            "timeout": 1500
+            "timeout": OUTPUT_TIMEOUT_MS
         });
 
         let result = tool.execute(input).await;
 
         assert!(result.is_error, "timeout should be an error: {}", result.content);
         assert!(
-            result.content.contains("Command timed out after 1500ms"),
+            result
+                .content
+                .contains(&format!("Command timed out after {OUTPUT_TIMEOUT_MS}ms")),
             "timeout message missing: {}",
             result.content
         );
