@@ -1,9 +1,11 @@
 use aion_types::tool::ToolDef;
 
 use crate::Tool;
+use crate::workspace::{SharedWorkspaceContext, WorkspacePathTool};
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    workspace: Option<SharedWorkspaceContext>,
 }
 
 impl Default for ToolRegistry {
@@ -13,11 +15,35 @@ impl Default for ToolRegistry {
 }
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            workspace: None,
+        }
+    }
+
+    /// Attach the same workspace handle used by this registry's built-in tools.
+    pub fn with_workspace(workspace: SharedWorkspaceContext) -> Self {
+        Self {
+            tools: Vec::new(),
+            workspace: Some(workspace),
+        }
+    }
+
+    pub fn workspace_context(&self) -> Option<&SharedWorkspaceContext> {
+        self.workspace.as_ref()
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
+    }
+
+    /// Register a built-in path tool with local workspace reference resolution.
+    pub fn register_path_tool(&mut self, tool: Box<dyn Tool>, parameter: &'static str) {
+        let tool = match &self.workspace {
+            Some(workspace) => Box::new(WorkspacePathTool::new(tool, workspace.clone(), parameter)) as Box<dyn Tool>,
+            None => tool,
+        };
+        self.register(tool);
     }
 
     /// Find a tool by name

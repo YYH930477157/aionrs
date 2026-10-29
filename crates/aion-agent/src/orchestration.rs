@@ -50,21 +50,32 @@ pub async fn execute_tool_calls(
             // For concurrent batch, confirm all first, then execute approved ones.
             // Concurrent tools are never SkillTool (is_concurrency_safe=false for Skill),
             // so no skill hooks merging is needed here.
-            let mut approved = Vec::new();
+            let mut prepared = Vec::new();
             for call in &batch.calls {
-                match confirm_call(confirmer, call)? {
-                    Some(denied) => {
-                        results.push(denied);
-                        modifiers.push(None);
+                let call = match prepare_call(registry, call) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        prepared.push(Err(error));
+                        continue;
                     }
-                    None => approved.push(call),
+                };
+                match confirm_call(confirmer, &call)? {
+                    Some(denied) => {
+                        prepared.push(Err(denied));
+                    }
+                    None => prepared.push(Ok(call)),
                 }
             }
             // Reborrow as shared for concurrent execution.
             let hooks_shared: Option<&HookEngine> = hooks.as_deref();
-            let futures: Vec<_> = approved
+            let futures: Vec<_> = prepared
                 .iter()
-                .map(|call| execute_single(registry, call, hooks_shared, compaction_level, toon_enabled))
+                .map(|call| async move {
+                    match call {
+                        Ok(call) => execute_single(registry, call, hooks_shared, compaction_level, toon_enabled).await,
+                        Err(error) => (error.clone(), None, Vec::new()),
+                    }
+                })
                 .collect();
             let batch_results = futures::future::join_all(futures).await;
             for (block, modifier, blocks) in batch_results {
@@ -74,7 +85,15 @@ pub async fn execute_tool_calls(
             }
         } else {
             for call in &batch.calls {
-                match confirm_call(confirmer, call)? {
+                let call = match prepare_call(registry, call) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        results.push(error);
+                        modifiers.push(None);
+                        continue;
+                    }
+                };
+                match confirm_call(confirmer, &call)? {
                     Some(denied) => {
                         results.push(denied);
                         modifiers.push(None);
@@ -87,11 +106,11 @@ pub async fn execute_tool_calls(
                         {
                             let hooks_shared: Option<&HookEngine> = hooks.as_deref();
                             (block, modifier, blocks) =
-                                execute_single(registry, call, hooks_shared, compaction_level, toon_enabled).await;
+                                execute_single(registry, &call, hooks_shared, compaction_level, toon_enabled).await;
                         }
                         // Merge skill hooks after a successful sequential execution.
                         if !block_is_error(&block) {
-                            maybe_merge_skill_hooks(registry, call, hooks.as_deref_mut());
+                            maybe_merge_skill_hooks(registry, &call, hooks.as_deref_mut());
                         }
                         results.push(block);
                         modifiers.push(modifier);
@@ -113,6 +132,23 @@ pub async fn execute_tool_calls(
 #[derive(Debug)]
 pub enum ExecutionControl {
     Quit,
+}
+
+/// Prepare only execution copies; preserve the original model history and user text.
+fn prepare_call(registry: &ToolRegistry, call: &ContentBlock) -> Result<ContentBlock, ContentBlock> {
+    let mut prepared = call.clone();
+    if let ContentBlock::ToolUse { id, name, input, .. } = &mut prepared
+        && let Some(tool) = registry.get(name)
+    {
+        *input = tool
+            .prepare_input(input.clone())
+            .map_err(|content| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content,
+                is_error: true,
+            })?;
+    }
+    Ok(prepared)
 }
 
 /// Confirm a single tool call. Returns Ok(Some(result)) if denied, Ok(None) if approved, Err if quit.
@@ -257,6 +293,28 @@ pub async fn execute_tool_calls_with_approval(
     let mut follow_up_blocks = Vec::new();
 
     for call in tool_calls {
+        let call = match prepare_call(registry, call) {
+            Ok(call) => call,
+            Err(error) => {
+                if let ContentBlock::ToolUse { id, name, .. } = call
+                    && let ContentBlock::ToolResult { content, .. } = &error
+                {
+                    let _ = writer.emit(&ProtocolEvent::ToolResult {
+                        msg_id: msg_id.to_string(),
+                        call_id: id.clone(),
+                        tool_name: name.clone(),
+                        status: ToolStatus::Error,
+                        output: content.clone(),
+                        output_type: OutputType::Text,
+                        metadata: None,
+                    });
+                }
+                results.push(error);
+                modifiers.push(None);
+                continue;
+            }
+        };
+        let call = &call;
         let ContentBlock::ToolUse { id, name, input, .. } = call else {
             continue;
         };

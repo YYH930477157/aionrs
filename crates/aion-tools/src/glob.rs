@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -7,16 +8,21 @@ use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
+use crate::workspace::{SharedWorkspaceContext, WorkspaceContext, snapshot};
 
 const MAX_RESULTS: usize = 100;
 
 pub struct GlobTool {
-    cwd: PathBuf,
+    workspace: SharedWorkspaceContext,
 }
 
 impl GlobTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_workspace(Arc::new(RwLock::new(WorkspaceContext::legacy(cwd))))
+    }
+
+    pub fn with_workspace(workspace: SharedWorkspaceContext) -> Self {
+        Self { workspace }
     }
 }
 
@@ -64,17 +70,29 @@ impl Tool for GlobTool {
             };
         };
 
-        let root = input["path"].as_str().unwrap_or(".");
-        let root_path = if Path::new(root).is_relative() {
-            self.cwd.join(root)
-        } else {
-            PathBuf::from(root)
+        let workspace = match snapshot(&self.workspace) {
+            Ok(workspace) => workspace,
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
+        };
+        let root_path = match workspace.resolve_path(&input, "path", true) {
+            Ok(path) => path,
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
         };
 
-        tracing::debug!(cwd = %self.cwd.display(), resolved_root = %root_path.display(), pattern = %pattern, "GlobTool scanning");
+        tracing::debug!(resolved_root = %root_path.display(), "GlobTool scanning");
 
         // Build full glob pattern
-        let full_pattern = if pattern.starts_with('/') {
+        let full_pattern = if Path::new(pattern).is_absolute() {
             pattern.to_string()
         } else {
             format!("{}/{}", root_path.display(), pattern)

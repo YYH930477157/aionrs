@@ -69,6 +69,7 @@ impl CommandRunner {
                 );
                 stdout_result?;
                 stderr_result?;
+                containment.preserve_descendants()?;
 
                 Ok(CommandResult {
                     exit_code: status.code(),

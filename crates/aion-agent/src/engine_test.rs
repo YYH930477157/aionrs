@@ -89,6 +89,34 @@ mod tests_set_config {
         engine
     }
 
+    #[test]
+    fn workspace_current_metadata_replaces_previous_turn_context() {
+        use crate::turn::TurnKind;
+        use aion_tools::workspace::{WorkspaceContext, WorkspaceRoot};
+        use std::sync::RwLock;
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = make_engine("test");
+        engine.tools = ToolRegistry::with_workspace(Arc::new(RwLock::new(WorkspaceContext::legacy(
+            dir.path().to_path_buf(),
+        ))));
+        let roots = vec![WorkspaceRoot {
+            id: "alpha".into(),
+            name: "Alpha root".into(),
+            path: dir.path().to_path_buf(),
+            available: true,
+        }];
+        engine
+            .update_workspace_context(Some(dir.path().to_path_buf()), roots)
+            .unwrap();
+        let request = engine.build_request(TurnKind::Normal);
+        assert!(request.system.contains("Alpha root") && request.system.contains("alpha"));
+        assert!(request.system.contains("ask the user"));
+        engine.update_workspace_context(None, vec![]).unwrap();
+        let request = engine.build_request(TurnKind::Normal);
+        assert!(request.system.contains("No default working directory"));
+        assert!(!request.system.contains("Alpha root"));
+    }
+
     // --- Cycle 1 tests (updated signature) ---
 
     #[test]

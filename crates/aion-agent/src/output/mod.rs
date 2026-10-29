@@ -5,4 +5,4 @@ mod sink;
 pub mod terminal;
 
 pub use formatter::OutputFormatter;
-pub use sink::OutputSink;
+pub use sink::{OutputSink, UsageReport};

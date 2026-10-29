@@ -22,6 +22,14 @@ impl ChildContainment {
     pub(crate) fn terminate(&self, child: &mut Child, child_id: Option<u32>) -> Result<()> {
         terminate_child(child, child_id, self)
     }
+
+    /// Completed commands may intentionally launch background processes. Only
+    /// disarm cancellation containment once the runner has finished draining.
+    pub(crate) fn preserve_descendants(&self) -> Result<()> {
+        #[cfg(windows)]
+        self.job.preserve_descendants()?;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]

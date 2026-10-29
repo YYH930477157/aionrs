@@ -74,6 +74,35 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn workspace_update_changes_registered_tools_and_model_context() {
+        let initial = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        std::fs::write(next.path().join("next.txt"), "next").unwrap();
+        let mut config = test_config();
+        config.mcp.servers.clear();
+        let output: Arc<dyn OutputSink> = Arc::new(NullSink);
+        let bootstrap = AgentBootstrap::new(config, initial.path().to_string_lossy(), output);
+        let mut result = bootstrap.build().await.unwrap();
+        let roots = vec![crate::engine::WorkspaceRoot {
+            id: "next-id".into(),
+            name: "Next project".into(),
+            path: next.path().to_path_buf(),
+            available: true,
+        }];
+        result
+            .engine
+            .update_workspace_context(Some(next.path().to_path_buf()), roots)
+            .unwrap();
+        let tool = result.engine.registry_mut().get("Glob").unwrap();
+        let files = tool.execute(json!({"pattern": "*.txt"})).await;
+        assert!(files.content.contains("next.txt"), "{}", files.content);
+        result.engine.update_workspace_context(None, vec![]).unwrap();
+        let tool = result.engine.registry_mut().get("ExecCommand").unwrap();
+        let command = tool.execute(json!({"cmd": "echo forbidden"})).await;
+        assert!(command.is_error, "{}", command.content);
+    }
+
     #[test]
     fn mcp_servers_with_runtime_env_uses_server_env_as_override() {
         let mut config = test_config();

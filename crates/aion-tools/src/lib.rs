@@ -8,6 +8,7 @@ pub mod registry;
 mod tool;
 pub mod tool_search;
 pub mod view_image;
+pub mod workspace;
 pub mod write;
 
 pub use tool::{Tool, ToolExecutionOutput, truncate_utf8};
