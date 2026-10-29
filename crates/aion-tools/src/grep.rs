@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -8,14 +9,19 @@ use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
+use crate::workspace::{SharedWorkspaceContext, WorkspaceContext, snapshot};
 
 pub struct GrepTool {
-    cwd: PathBuf,
+    workspace: SharedWorkspaceContext,
 }
 
 impl GrepTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_workspace(Arc::new(RwLock::new(WorkspaceContext::legacy(cwd))))
+    }
+
+    pub fn with_workspace(workspace: SharedWorkspaceContext) -> Self {
+        Self { workspace }
     }
 }
 
@@ -72,14 +78,26 @@ impl Tool for GrepTool {
             };
         };
 
-        let raw_path = input["path"].as_str().unwrap_or(".");
-        let path = if std::path::Path::new(raw_path).is_relative() {
-            self.cwd.join(raw_path).to_string_lossy().into_owned()
-        } else {
-            raw_path.to_owned()
+        let workspace = match snapshot(&self.workspace) {
+            Ok(workspace) => workspace,
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
+        };
+        let path = match workspace.resolve_path(&input, "path", false) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
         };
 
-        tracing::debug!(cwd = %self.cwd.display(), resolved_path = %path, pattern = %pattern, "GrepTool searching");
+        tracing::debug!(resolved_path = %path, "GrepTool searching");
 
         let glob_pattern = input["glob"].as_str();
         let case_insensitive = input["case_insensitive"].as_bool().unwrap_or(false);

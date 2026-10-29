@@ -1,10 +1,15 @@
+use std::mem::size_of;
 use std::os::windows::io::RawHandle;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject,
+};
 use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
 pub(crate) struct JobObject {
@@ -22,6 +27,10 @@ impl JobObject {
         }
 
         let this = Self { job };
+        // Cancellation drops the runner future rather than reaching its timeout
+        // branch. Keep descendants contained until the command finishes normally.
+        this.set_kill_on_close(true)
+            .map_err(|error| format!("SetInformationJobObject failed: {error}"))?;
 
         let ok = unsafe { AssignProcessToJobObject(job, child_raw as HANDLE) };
         if ok == 0 {
@@ -37,6 +46,33 @@ impl JobObject {
         }
 
         Ok(this)
+    }
+
+    pub(crate) fn preserve_descendants(&self) -> std::io::Result<()> {
+        self.set_kill_on_close(false)
+    }
+
+    fn set_kill_on_close(&self, enabled: bool) -> std::io::Result<()> {
+        let information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: if enabled { JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE } else { 0 },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.job,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn terminate(&self) -> std::io::Result<()> {

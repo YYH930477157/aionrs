@@ -8,6 +8,11 @@ use lru::LruCache;
 use aion_config::file_cache::FileCacheConfig;
 use aion_types::file_state::FileState;
 
+struct CachedFileState {
+    state: FileState,
+    read_observed: bool,
+}
+
 /// LRU cache for file states seen by the model.
 ///
 /// Provides dual eviction: entry-count limit (via LRU) and byte-size limit
@@ -18,7 +23,7 @@ use aion_types::file_state::FileState;
 /// sharing across tools. Cache operations are brief (hash lookup + insert),
 /// so `std::sync::RwLock` is preferred over `tokio::sync::RwLock`.
 pub struct FileStateCache {
-    entries: LruCache<PathBuf, FileState>,
+    entries: LruCache<PathBuf, CachedFileState>,
     max_size_bytes: usize,
     current_size_bytes: usize,
 }
@@ -39,7 +44,16 @@ impl FileStateCache {
     /// Look up a file state, promoting it to most-recently-used.
     pub fn get(&mut self, path: &Path) -> Option<&FileState> {
         let normalized = normalize_path(path);
-        self.entries.get(&normalized)
+        self.entries.get(&normalized).map(|entry| &entry.state)
+    }
+
+    /// Dedup only content actually returned by Read, not content inferred from a write.
+    pub(crate) fn get_last_read(&mut self, path: &Path) -> Option<&FileState> {
+        let normalized = normalize_path(path);
+        self.entries
+            .get(&normalized)
+            .filter(|entry| entry.read_observed)
+            .map(|entry| &entry.state)
     }
 
     /// Insert or update a file state entry.
@@ -47,24 +61,32 @@ impl FileStateCache {
     /// Evicts least-recently-used entries when the byte-size limit or
     /// entry-count limit would be exceeded.
     pub fn insert(&mut self, path: PathBuf, state: FileState) {
+        self.insert_state(path, state, true);
+    }
+
+    fn insert_state(&mut self, path: PathBuf, state: FileState, read_observed: bool) {
         let normalized = normalize_path(&path);
         let new_size = state.content_bytes();
 
         // Remove existing entry for this key first (simplifies size accounting).
         if let Some(old) = self.entries.pop(&normalized) {
-            self.current_size_bytes = self.current_size_bytes.saturating_sub(old.content_bytes());
+            self.current_size_bytes = self.current_size_bytes.saturating_sub(old.state.content_bytes());
         }
 
         // Evict LRU entries until byte-size budget is available.
         while self.current_size_bytes + new_size > self.max_size_bytes && !self.entries.is_empty() {
             if let Some((_k, v)) = self.entries.pop_lru() {
-                self.current_size_bytes = self.current_size_bytes.saturating_sub(v.content_bytes());
+                self.current_size_bytes = self.current_size_bytes.saturating_sub(v.state.content_bytes());
             }
         }
 
         // push() returns evicted (key, value) if entry-count capacity is reached.
-        if let Some((_evicted_key, evicted_val)) = self.entries.push(normalized, state) {
-            self.current_size_bytes = self.current_size_bytes.saturating_sub(evicted_val.content_bytes());
+        if let Some((_evicted_key, evicted_val)) =
+            self.entries.push(normalized, CachedFileState { state, read_observed })
+        {
+            self.current_size_bytes = self
+                .current_size_bytes
+                .saturating_sub(evicted_val.state.content_bytes());
         }
         self.current_size_bytes += new_size;
     }
@@ -72,7 +94,7 @@ impl FileStateCache {
     /// Remove a specific entry by path.
     pub fn remove(&mut self, path: &Path) -> Option<FileState> {
         let normalized = normalize_path(path);
-        let removed = self.entries.pop(&normalized);
+        let removed = self.entries.pop(&normalized).map(|entry| entry.state);
         if let Some(ref v) = removed {
             self.current_size_bytes = self.current_size_bytes.saturating_sub(v.content_bytes());
         }
@@ -118,7 +140,7 @@ pub fn update_cache_after_write(cache_arc: &Arc<std::sync::RwLock<FileStateCache
         .enumerate()
         .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
         .collect();
-    cache.insert(
+    cache.insert_state(
         path.to_path_buf(),
         FileState {
             content: numbered.join("\n"),
@@ -126,6 +148,7 @@ pub fn update_cache_after_write(cache_arc: &Arc<std::sync::RwLock<FileStateCache
             offset: None,
             limit: None,
         },
+        false,
     );
 }
 

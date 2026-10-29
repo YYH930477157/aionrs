@@ -12,14 +12,14 @@ use crate::compact::micro::{microcompact, should_microcompact};
 use crate::compact::state::CompactState;
 use crate::confirm::ToolConfirmer;
 use crate::context_usage::{
-    ContextState, ContextStatus, PromptUsage, estimate_content_tokens, estimate_messages_tokens, estimate_text_tokens,
-    estimate_tool_definitions_tokens,
+    ContextState, ContextStatus, ContextUsageSource, PromptUsage, estimate_content_tokens, estimate_messages_tokens,
+    estimate_text_tokens, estimate_tool_definitions_tokens,
 };
 use crate::error::AgentError;
 use crate::orchestration::{
     ExecutionControl, execute_tool_calls_with_approval_and_output_limit, execute_tool_calls_with_output_limit,
 };
-use crate::output::OutputSink;
+use crate::output::{OutputSink, UsageReport};
 use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
 use crate::session::{Session, SessionManager};
@@ -41,6 +41,7 @@ use aion_protocol::events::ToolCategory;
 use aion_protocol::writer::ProtocolEmitter;
 use aion_providers::provider::{LlmProvider, create_provider};
 use aion_tools::registry::ToolRegistry;
+pub use aion_tools::workspace::{WorkspaceContext, WorkspaceRoot};
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use aion_types::message::{ContentBlock, ImageInputCapability, Message, Role, StopReason, TokenUsage};
 use aion_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
@@ -162,6 +163,37 @@ pub struct AgentEngine {
 }
 
 impl AgentEngine {
+    /// Apply the host's latest workspace selection before the next turn.
+    /// Existing tool invocations retain the directory they resolved at entry.
+    pub fn update_workspace_context(
+        &mut self,
+        default_cwd: Option<PathBuf>,
+        roots: Vec<WorkspaceRoot>,
+    ) -> AnyhowResult<()> {
+        if default_cwd.as_ref().is_some_and(|path| !path.is_absolute()) {
+            anyhow::bail!("Workspace default must be an absolute path");
+        }
+        let shared = self
+            .tools
+            .workspace_context()
+            .ok_or_else(|| anyhow::anyhow!("Engine has no shared workspace context"))?;
+        *shared
+            .write()
+            .map_err(|_| anyhow::anyhow!("Workspace context lock poisoned"))? = WorkspaceContext { default_cwd, roots };
+        self.refresh_local_context_estimate();
+        Ok(())
+    }
+
+    fn workspace_prompt(&self) -> String {
+        let Some(shared) = self.tools.workspace_context() else {
+            return String::new();
+        };
+        match shared.read() {
+            Ok(context) => context.prompt_section(),
+            Err(_) => "Workspace context unavailable. Ask the user before selecting a command directory.".to_string(),
+        }
+    }
+
     pub fn new(config: Config, tools: ToolRegistry, output: Arc<dyn OutputSink>, cwd: PathBuf) -> Self {
         let provider = create_provider(&config);
         Self::new_with_provider(provider, config, tools, output, cwd)
@@ -663,11 +695,16 @@ impl AgentEngine {
         let tools = self.tool_definitions_for_turn(kind);
 
         // Build system prompt: append plan mode instructions when active
-        let system = if self.plan_state.is_active {
+        let mut system = if self.plan_state.is_active {
             format!("{}\n\n{}", self.system_prompt, plan_mode_instructions())
         } else {
             self.system_prompt.clone()
         };
+        let workspace_prompt = self.workspace_prompt();
+        if !workspace_prompt.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&workspace_prompt);
+        }
 
         // Record prompt state for cache diagnostics
         self.cache_detector.record_request(&system, &tools);
@@ -898,6 +935,7 @@ impl AgentEngine {
             // autocompact nor emergency will fire.
             self.run_compaction().await?;
             let request = self.build_request(kind);
+            let call_started = std::time::Instant::now();
             let mut rx = self.provider.stream(&request).await?;
             let outcome = self.consume_stream(&mut rx).await?;
             let has_provider_usage = self.record_turn_usage(&outcome.usage);
@@ -905,6 +943,16 @@ impl AgentEngine {
                 let assistant_content = build_assistant_content(&outcome);
                 self.record_local_context_addition(estimate_content_tokens(&assistant_content));
             }
+            self.output.emit_usage(&UsageReport {
+                input_tokens: outcome.usage.input_tokens,
+                output_tokens: outcome.usage.output_tokens,
+                cache_creation_tokens: outcome.usage.cache_creation_tokens,
+                cache_read_tokens: outcome.usage.cache_read_tokens,
+                context_usage: self.context_state.context_usage,
+                context_provider_reported: self.context_state.source == ContextUsageSource::ProviderExact,
+                context_window: self.compact_config.context_window as u64,
+                duration_ms: call_started.elapsed().as_millis() as u64,
+            });
             Ok(outcome)
         }
         .instrument(span)
@@ -1131,11 +1179,12 @@ impl AgentEngine {
     }
 
     fn dynamic_system_tokens(&self) -> u64 {
-        if self.plan_state.is_active {
+        let plan_tokens = if self.plan_state.is_active {
             estimate_text_tokens(plan_mode_instructions())
         } else {
             0
-        }
+        };
+        plan_tokens.saturating_add(estimate_text_tokens(&self.workspace_prompt()))
     }
 
     /// Run context compaction guards before each API call.

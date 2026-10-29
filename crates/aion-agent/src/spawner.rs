@@ -1,7 +1,10 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use futures::FutureExt;
+use futures::future::join_all;
 
 use aion_config::config::Config;
 use aion_providers::LlmProvider;
@@ -11,6 +14,7 @@ use aion_tools::glob::GlobTool;
 use aion_tools::grep::GrepTool;
 use aion_tools::read::ReadTool;
 use aion_tools::registry::ToolRegistry;
+use aion_tools::workspace::{SharedWorkspaceContext, WorkspaceContext};
 use aion_tools::write::WriteTool;
 use aion_types::message::TokenUsage;
 
@@ -35,6 +39,7 @@ pub struct AgentSpawner {
     provider: Arc<dyn LlmProvider>,
     base_config: Config,
     cwd: PathBuf,
+    workspace: SharedWorkspaceContext,
     runtime_env: Vec<(String, String)>,
     tool_policy: ToolPolicy,
 }
@@ -54,10 +59,16 @@ impl AgentSpawner {
         Self {
             provider,
             base_config: config,
+            workspace: Arc::new(RwLock::new(WorkspaceContext::legacy(cwd.clone()))),
             cwd,
             runtime_env,
             tool_policy,
         }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: SharedWorkspaceContext) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     /// Spawn a single sub-agent and wait for result.
@@ -71,10 +82,10 @@ impl AgentSpawner {
         config.session.enabled = false;
         config.tools.auto_approve = true;
 
-        tracing::info!(target: "aion_agent", cwd = %self.cwd.display(), "sub-agent spawned with workspace cwd");
+        tracing::info!(target: "aion_agent", "sub-agent spawned with shared workspace context");
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &[]);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let tools = build_tool_registry(&child_policy, self.workspace.clone(), &self.runtime_env);
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -106,38 +117,23 @@ impl AgentSpawner {
 
     /// Spawn multiple sub-agents in parallel.
     pub async fn spawn_parallel(&self, sub_configs: Vec<SubAgentConfig>) -> Vec<SubAgentResult> {
-        let futures: Vec<_> = sub_configs
-            .into_iter()
-            .map(|config| {
-                let spawner = self.clone_for_spawn();
-                tokio::spawn(async move { spawner.spawn_one(config).await })
-            })
-            .collect();
-
-        let mut results = Vec::new();
-        for future in futures {
-            match future.await {
-                Ok(result) => results.push(result),
-                Err(e) => results.push(SubAgentResult {
-                    name: "unknown".to_string(),
-                    text: format!("Task join error: {}", e),
+        // Own child futures directly so dropping the parent drops every child
+        // before the caller releases its workspace lease. Detached Tokio tasks
+        // would otherwise keep issuing tools after the parent was cancelled.
+        join_all(sub_configs.into_iter().map(|config| async move {
+            let name = config.name.clone();
+            match AssertUnwindSafe(self.spawn_one(config)).catch_unwind().await {
+                Ok(result) => result,
+                Err(_) => SubAgentResult {
+                    name,
+                    text: "Sub-agent task panicked".to_string(),
                     usage: TokenUsage::default(),
                     turns: 0,
                     is_error: true,
-                }),
+                },
             }
-        }
-        results
-    }
-
-    fn clone_for_spawn(&self) -> Self {
-        Self {
-            provider: self.provider.clone(),
-            base_config: self.base_config.clone(),
-            cwd: self.cwd.clone(),
-            runtime_env: self.runtime_env.clone(),
-            tool_policy: self.tool_policy.clone(),
-        }
+        }))
+        .await
     }
 }
 
@@ -157,7 +153,7 @@ impl Spawner for AgentSpawner {
         }
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &overrides.allowed_tools);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let tools = build_tool_registry(&child_policy, self.workspace.clone(), &self.runtime_env);
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -202,23 +198,36 @@ fn effective_child_tool_policy(parent: &ToolPolicy, allowed_tools: &[String]) ->
     )
 }
 
-fn build_tool_registry(policy: &ToolPolicy, cwd: &Path, runtime_env: &[(String, String)]) -> ToolRegistry {
+fn build_tool_registry(
+    policy: &ToolPolicy,
+    workspace: SharedWorkspaceContext,
+    runtime_env: &[(String, String)],
+) -> ToolRegistry {
     let all_tools: Vec<(&str, Box<dyn aion_tools::Tool>)> = vec![
+        (
+            "Workspace",
+            Box::new(aion_tools::workspace::WorkspaceTool::new(workspace.clone())),
+        ),
         ("Read", Box::new(ReadTool::new(None))),
         ("Write", Box::new(WriteTool::new(None))),
         ("Edit", Box::new(EditTool::new(None))),
         (
             "ExecCommand",
-            Box::new(ExecCommandTool::new_with_env(cwd.to_path_buf(), runtime_env.to_vec())),
+            Box::new(ExecCommandTool::with_workspace(workspace.clone(), runtime_env.to_vec())),
         ),
-        ("Grep", Box::new(GrepTool::new(cwd.to_path_buf()))),
-        ("Glob", Box::new(GlobTool::new(cwd.to_path_buf()))),
+        ("Grep", Box::new(GrepTool::with_workspace(workspace.clone()))),
+        ("Glob", Box::new(GlobTool::with_workspace(workspace.clone()))),
     ];
 
-    let mut registry = ToolRegistry::new();
+    let mut registry = ToolRegistry::with_workspace(workspace);
     for (name, tool) in all_tools {
         if policy.allows(name) {
-            registry.register(tool);
+            match name {
+                "Read" | "Write" | "Edit" => registry.register_path_tool(tool, "file_path"),
+                "ExecCommand" => registry.register_path_tool(tool, "workdir"),
+                "Grep" | "Glob" => registry.register_path_tool(tool, "path"),
+                _ => registry.register(tool),
+            }
         }
     }
     registry

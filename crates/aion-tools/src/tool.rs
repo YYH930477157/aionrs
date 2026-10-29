@@ -54,6 +54,11 @@ pub trait Tool: Send + Sync {
     /// Whether this tool is safe to run concurrently
     fn is_concurrency_safe(&self, input: &Value) -> bool;
 
+    /// Resolve local input references before approval and hooks. Must not perform the tool action.
+    fn prepare_input(&self, input: Value) -> Result<Value, String> {
+        Ok(input)
+    }
+
     /// Execute the tool
     async fn execute(&self, input: Value) -> ToolResult;
 

@@ -21,6 +21,7 @@ use aion_tools::read::ReadTool;
 use aion_tools::registry::ToolRegistry;
 use aion_tools::tool_search::ToolSearchTool;
 use aion_tools::view_image::ViewImageTool;
+use aion_tools::workspace::WorkspaceContext;
 use aion_tools::write::WriteTool;
 use anyhow::Result;
 use tracing::info;
@@ -218,18 +219,23 @@ impl AgentBootstrap {
 
     fn build_builtin_registry(&self, workspace_path: &Path) -> ToolRegistry {
         let file_cache = self.build_file_cache();
-        let mut registry = ToolRegistry::new();
+        let workspace = Arc::new(RwLock::new(WorkspaceContext::legacy(workspace_path.to_path_buf())));
+        let mut registry = ToolRegistry::with_workspace(workspace.clone());
 
-        registry.register(Box::new(ReadTool::new(file_cache.clone())));
-        registry.register(Box::new(WriteTool::new(file_cache.clone())));
-        registry.register(Box::new(EditTool::new(file_cache)));
-        registry.register(Box::new(ExecCommandTool::new_with_env(
-            workspace_path.to_path_buf(),
-            self.runtime_env.clone(),
-        )));
-        registry.register(Box::new(GrepTool::new(workspace_path.to_path_buf())));
-        registry.register(Box::new(GlobTool::new(workspace_path.to_path_buf())));
-        registry.register(Box::new(ViewImageTool::new()));
+        registry.register(Box::new(aion_tools::workspace::WorkspaceTool::new(workspace.clone())));
+        registry.register_path_tool(Box::new(ReadTool::new(file_cache.clone())), "file_path");
+        registry.register_path_tool(Box::new(WriteTool::new(file_cache.clone())), "file_path");
+        registry.register_path_tool(Box::new(EditTool::new(file_cache)), "file_path");
+        registry.register_path_tool(
+            Box::new(ExecCommandTool::with_workspace(
+                workspace.clone(),
+                self.runtime_env.clone(),
+            )),
+            "workdir",
+        );
+        registry.register_path_tool(Box::new(GrepTool::with_workspace(workspace.clone())), "path");
+        registry.register_path_tool(Box::new(GlobTool::with_workspace(workspace)), "path");
+        registry.register_path_tool(Box::new(ViewImageTool::new()), "file_path");
 
         registry
     }
@@ -348,13 +354,16 @@ impl AgentBootstrap {
             skill_checker,
         )));
 
-        let spawner = AgentSpawner::new_with_env(
+        let mut spawner = AgentSpawner::new_with_env(
             Arc::clone(provider),
             self.config.clone(),
             workspace.to_path_buf(),
             self.runtime_env.clone(),
             self.tool_policy.clone(),
         );
+        if let Some(workspace) = registry.workspace_context() {
+            spawner = spawner.with_workspace(workspace.clone());
+        }
         registry.register(Box::new(SpawnTool::new(Arc::new(spawner))));
     }
 

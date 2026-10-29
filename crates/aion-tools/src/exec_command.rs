@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,26 +12,28 @@ use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
+use crate::workspace::{SharedWorkspaceContext, WorkspaceContext, snapshot};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 
 pub struct ExecCommandTool {
-    cwd: PathBuf,
+    workspace: SharedWorkspaceContext,
     runtime_env: HashMap<String, String>,
 }
 
 impl ExecCommandTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            runtime_env: HashMap::new(),
-        }
+        Self::new_with_env(cwd, Vec::new())
     }
 
     pub fn new_with_env(cwd: PathBuf, runtime_env: Vec<(String, String)>) -> Self {
+        Self::with_workspace(Arc::new(RwLock::new(WorkspaceContext::legacy(cwd))), runtime_env)
+    }
+
+    pub fn with_workspace(workspace: SharedWorkspaceContext, runtime_env: Vec<(String, String)>) -> Self {
         Self {
-            cwd,
+            workspace,
             runtime_env: runtime_env.into_iter().collect(),
         }
     }
@@ -64,6 +67,9 @@ impl Tool for ExecCommandTool {
          - Write files: use Write (not echo or cat with heredoc)\n\n\
          # Instructions\n\
          - Use absolute paths to avoid working directory confusion.\n\
+         - workdir selects the command's directory; a relative workdir resolves against the current workspace default.\n\
+         - With no default directory, provide an absolute workdir. Invalid directories fail without fallback.\n\
+         - If a generic command could refer to multiple roots and the intended root is unclear, ask the user.\n\
          - When issuing multiple independent commands, make parallel tool calls \
          instead of chaining them. Use `&&` only when commands depend on each other.\n\
          - You may specify an optional timeout in milliseconds (default 120000, max 600000).\n\n\
@@ -83,6 +89,10 @@ impl Tool for ExecCommandTool {
                 "shell": {
                     "type": "string",
                     "description": "Optional shell override: auto, powershell, pwsh, cmd, bash, zsh, sh, or an executable path"
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory: absolute path or path relative to the current default. Omit only when the current default is the intended root."
                 },
                 "timeout": {
                     "type": "integer",
@@ -105,6 +115,26 @@ impl Tool for ExecCommandTool {
             };
         };
 
+        // Snapshot before awaiting: later default changes affect subsequent commands only.
+        let workspace = match snapshot(&self.workspace) {
+            Ok(workspace) => workspace,
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
+        };
+        let cwd = match workspace.resolve_path(&input, "workdir", true) {
+            Ok(cwd) => cwd,
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
+        };
+        let label = workspace.execution_label(&cwd);
         let shell = match resolve_shell(input["shell"].as_str()) {
             Ok(shell) => shell,
             Err(err) => {
@@ -116,7 +146,7 @@ impl Tool for ExecCommandTool {
         };
 
         tracing::info!(
-            cwd = %self.cwd.display(),
+            cwd = %cwd.display(),
             shell_kind = shell.kind.name(),
             shell_path = %shell.path.display(),
             "ExecCommandTool executing"
@@ -129,7 +159,6 @@ impl Tool for ExecCommandTool {
 
         let timeout = Duration::from_millis(timeout_ms);
 
-        let cwd = self.cwd.clone();
         let mut command_builder = shell_command_builder(&shell, command, false);
         command_builder.envs(&self.runtime_env).current_dir(&cwd);
 
@@ -137,18 +166,24 @@ impl Tool for ExecCommandTool {
 
         match result {
             Ok(result) if result.timed_out => ToolResult {
-                content: render_timeout_result(timeout_ms, &result.stdout, &result.stderr),
+                content: format!(
+                    "{label}\n{}",
+                    render_timeout_result(timeout_ms, &result.stdout, &result.stderr)
+                ),
                 is_error: true,
             },
             Ok(result) => {
                 let exit_code = result.exit_code.unwrap_or(-1);
                 ToolResult {
-                    content: render_exit_result(exit_code, &result.stdout, &result.stderr),
+                    content: format!(
+                        "{label}\n{}",
+                        render_exit_result(exit_code, &result.stdout, &result.stderr)
+                    ),
                     is_error: exit_code != 0,
                 }
             }
             Err(err) => ToolResult {
-                content: format!("Failed to execute command: {}", err),
+                content: format!("{label}\nFailed to execute command: {err}"),
                 is_error: true,
             },
         }

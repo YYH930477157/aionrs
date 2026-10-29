@@ -151,6 +151,7 @@ name = "aion-process"
 version = "0.2.11"
 dependencies = [
  "libc",
+ "tempfile",
  "tokio",
  "windows-sys 0.61.2",
  "workspace-hack",

@@ -145,6 +145,41 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn runner_cancellation_kills_windows_job_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("child.pid");
+        let quoted_path = pid_file.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 30' -PassThru -WindowStyle Hidden; Set-Content -LiteralPath '{quoted_path}' -Value $p.Id; Wait-Process -Id $p.Id"
+        );
+        let task = tokio::spawn(CommandRunner::new(shell_command(&script)).run());
+        let pid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        let pid = pid.expect("child process must start before cancellation");
+        for _ in 0..40 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Always clean up the real child when the regression fails.
+        terminate_process(pid);
+        panic!("child process {pid} survived command cancellation");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn runner_completed_command_keeps_windows_background_descendant_running() {
         let script = "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 10' -PassThru -WindowStyle Hidden; Write-Output $p.Id";
         let result = CommandRunner::new(shell_command(script))
