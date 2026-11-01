@@ -3,6 +3,12 @@ use std::path::{Component, Path, PathBuf};
 use super::WorkspaceContext;
 
 impl WorkspaceContext {
+    fn names_existing_path(&self, value: &str) -> bool {
+        self.default_cwd
+            .as_ref()
+            .is_some_and(|default| default.join(value).exists())
+    }
+
     /// Resolve only explicit workspace references; ordinary path/prose semantics are unchanged.
     pub(super) fn resolve_reference(&self, value: &str) -> Result<Option<PathBuf>, String> {
         let Some(reference) = value.strip_prefix('@') else {
@@ -37,6 +43,8 @@ impl WorkspaceContext {
             by_id
         };
         let root = match matches.as_slice() {
+            // `@scope/package` is also an ordinary folder name, so a path that exists stays a path.
+            [] if self.roots.is_empty() || self.names_existing_path(value) => return Ok(None),
             [] => {
                 return Err(format!(
                     "Unknown workspace root '{selector}'. Use Workspace to inspect current roots; ask the user if the intended root is unclear."
@@ -95,5 +103,66 @@ impl WorkspaceContext {
             }
         }
         Ok(Some(target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::WorkspaceRoot;
+    use super::*;
+
+    fn with_root(default: &Path, root: &Path) -> WorkspaceContext {
+        WorkspaceContext {
+            default_cwd: Some(default.to_path_buf()),
+            roots: vec![WorkspaceRoot {
+                id: "lib".into(),
+                name: "library".into(),
+                path: root.to_path_buf(),
+                available: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_single_folder_conversation_keeps_at_paths_as_ordinary_paths() {
+        let context = WorkspaceContext::legacy(PathBuf::from("/project"));
+
+        assert_eq!(context.resolve_reference("@types/node/index.d.ts"), Ok(None));
+    }
+
+    #[test]
+    fn an_existing_scoped_folder_is_not_mistaken_for_a_root() {
+        let default = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(default.path().join("@scope")).unwrap();
+
+        let context = with_root(default.path(), root.path());
+
+        assert_eq!(context.resolve_reference("@scope"), Ok(None));
+    }
+
+    #[test]
+    fn a_mistyped_root_is_still_reported() {
+        let default = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let error = with_root(default.path(), root.path())
+            .resolve_reference("@librarry/file.txt")
+            .unwrap_err();
+
+        assert!(error.contains("Unknown workspace root"), "{error}");
+    }
+
+    #[test]
+    fn a_named_root_wins_over_a_folder_with_the_same_name() {
+        let default = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(default.path().join("@library")).unwrap();
+
+        let resolved = with_root(default.path(), root.path())
+            .resolve_reference("@library/file.txt")
+            .unwrap();
+
+        assert_eq!(resolved, Some(root.path().join("file.txt")));
     }
 }
