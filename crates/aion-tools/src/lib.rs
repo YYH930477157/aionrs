@@ -3,6 +3,7 @@ pub mod exec_command;
 pub mod file_cache;
 pub mod glob;
 pub mod grep;
+mod grep_search;
 pub mod read;
 pub mod registry;
 mod tool;

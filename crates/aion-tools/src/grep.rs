@@ -3,12 +3,13 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
+use tokio::task;
 
 use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
+use crate::grep_search::{MAX_FILE_BYTES, MAX_RESULT_LINES, SearchOutcome, SearchRequest, search};
 use crate::workspace::{SharedWorkspaceContext, WorkspaceContext, snapshot};
 
 pub struct GrepTool {
@@ -32,11 +33,13 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Searches file contents using regex patterns (powered by ripgrep).\n\n\
+        "Searches file contents using regex patterns.\n\n\
          IMPORTANT: ALWAYS use this Grep tool for content search. \
-         NEVER run grep or rg as a ExecCommand command.\n\n\
-         - Supports full regex syntax (e.g., \"log.*Error\", \"fn\\\\s+\\\\w+\").\n\
-         - Use the glob parameter to filter by file pattern (e.g., \"*.rs\").\n\
+         NEVER run grep, rg or findstr as a ExecCommand command.\n\n\
+         - Uses Rust regex syntax (e.g., \"log.*Error\", \"fn\\\\s+\\\\w+\", \"foo|bar\"); \
+         look-around and backreferences are not supported.\n\
+         - Searches folders recursively, honours .gitignore, and skips hidden and binary files.\n\
+         - Use the glob parameter to filter by file pattern (e.g., \"*.rs\" or \"*.{c,h}\").\n\
          - Output is truncated to 250 lines.\n\
          - Set case_insensitive to true for case-insensitive search."
     }
@@ -51,7 +54,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: cwd)"
+                    "description": "Directory or file to search in (default: cwd)"
                 },
                 "glob": {
                     "type": "string",
@@ -87,8 +90,8 @@ impl Tool for GrepTool {
                 };
             }
         };
-        let path = match workspace.resolve_path(&input, "path", false) {
-            Ok(path) => path.to_string_lossy().into_owned(),
+        let root = match workspace.resolve_path(&input, "path", false) {
+            Ok(path) => path,
             Err(content) => {
                 return ToolResult {
                     content,
@@ -97,20 +100,32 @@ impl Tool for GrepTool {
             }
         };
 
-        tracing::debug!(resolved_path = %path, "GrepTool searching");
+        tracing::debug!(resolved_path = %root.display(), "GrepTool searching");
 
-        let glob_pattern = input["glob"].as_str();
+        let pattern = pattern.to_owned();
+        let glob = input["glob"].as_str().map(str::to_owned);
         let case_insensitive = input["case_insensitive"].as_bool().unwrap_or(false);
+        // Walking and matching are blocking file and CPU work.
+        let searched = task::spawn_blocking(move || {
+            search(&SearchRequest {
+                pattern: &pattern,
+                root: &root,
+                glob: glob.as_deref(),
+                case_insensitive,
+            })
+        })
+        .await;
 
-        // Try ripgrep first, fallback to grep
-        let result = try_ripgrep(pattern, &path, glob_pattern, case_insensitive).await;
-
-        match result {
-            Ok(output) => output,
-            Err(_) => {
-                // Fallback to grep
-                try_grep(pattern, &path, case_insensitive).await
-            }
+        match searched {
+            Ok(Ok(outcome)) => render(outcome),
+            Ok(Err(content)) => ToolResult {
+                content,
+                is_error: true,
+            },
+            Err(error) => ToolResult {
+                content: format!("Grep failed: {error}"),
+                is_error: true,
+            },
         }
     }
 
@@ -129,89 +144,42 @@ impl Tool for GrepTool {
     }
 }
 
-async fn try_ripgrep(
-    pattern: &str,
-    path: &str,
-    glob_pattern: Option<&str>,
-    case_insensitive: bool,
-) -> Result<ToolResult, std::io::Error> {
-    let mut cmd = Command::new("rg");
-    cmd.arg(pattern).arg(path).arg("-n");
-
-    if let Some(g) = glob_pattern {
-        cmd.arg("--glob").arg(g);
+/// Format matches as `path:line:text` rows, and say why a search came back
+/// empty when files were skipped, so "no matches" is never a silent guess.
+fn render(outcome: SearchOutcome) -> ToolResult {
+    let mut notes = Vec::new();
+    if outcome.unreadable > 0 {
+        notes.push(format!("{} files or folders could not be read", outcome.unreadable));
     }
-    if case_insensitive {
-        cmd.arg("-i");
-    }
-
-    let output = cmd.output().await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if output.status.code() == Some(1) && stdout.is_empty() {
-        return Ok(ToolResult {
-            content: "No matches found".to_string(),
-            is_error: false,
-        });
-    }
-
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Ok(ToolResult {
-            content: format!("rg error: {}", stderr),
-            is_error: true,
-        });
-    }
-
-    // Truncate to 250 lines (global limit, not per-file)
-    let lines: Vec<&str> = stdout.lines().take(250).collect();
-    Ok(ToolResult {
-        content: lines.join("\n"),
-        is_error: false,
-    })
-}
-
-async fn try_grep(pattern: &str, path: &str, case_insensitive: bool) -> ToolResult {
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("findstr");
-        c.arg("/S")
-            .arg("/N")
-            .arg("/R")
-            .arg(pattern)
-            .arg(format!("{}\\*", path.trim_end_matches(['\\', '/'])));
-        if case_insensitive {
-            c.arg("/I");
+    if outcome.lines.is_empty() {
+        if outcome.skipped_binary > 0 {
+            notes.push(format!("{} binary files were skipped", outcome.skipped_binary));
         }
-        c
+        if outcome.skipped_large > 0 {
+            notes.push(format!(
+                "{} files over {} MiB were skipped",
+                outcome.skipped_large,
+                MAX_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+
+    let mut content = if outcome.lines.is_empty() {
+        "No matches found".to_string()
     } else {
-        let mut c = Command::new("grep");
-        c.arg("-rn").arg(pattern).arg(path);
-        if case_insensitive {
-            c.arg("-i");
-        }
-        c
+        outcome.lines.join("\n")
     };
-
-    match cmd.output().await {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.is_empty() {
-                ToolResult {
-                    content: "No matches found".to_string(),
-                    is_error: false,
-                }
-            } else {
-                let lines: Vec<&str> = stdout.lines().take(250).collect();
-                ToolResult {
-                    content: lines.join("\n"),
-                    is_error: false,
-                }
-            }
-        }
-        Err(e) => ToolResult {
-            content: format!("grep failed: {}", e),
-            is_error: true,
-        },
+    if outcome.truncated {
+        content.push_str(&format!(
+            "\n[Output truncated to the first {MAX_RESULT_LINES} matching lines]"
+        ));
+    }
+    if !notes.is_empty() {
+        content.push_str(&format!("\n[{}]", notes.join("; ")));
+    }
+    ToolResult {
+        content,
+        is_error: false,
     }
 }
 
