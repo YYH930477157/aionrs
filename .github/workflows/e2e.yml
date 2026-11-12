@@ -16,7 +16,7 @@ on:
         type: choice
         options: [all, anthropic, openai]
   push:
-    branches: [main]
+    branches: [woody]
     paths:
       - "crates/aion-providers/**"
       - "crates/aion-agent/**"
@@ -25,7 +25,7 @@ on:
       - "crates/aion-skills/**"
       - ".github/workflows/e2e.yml"
   pull_request:
-    branches: [main]
+    branches: [woody]
     paths:
       - "crates/aion-providers/**"
       - "crates/aion-agent/**"
