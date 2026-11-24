@@ -122,7 +122,7 @@ mod tests {
         tokio::time::pause();
 
         let counter = Arc::new(AtomicU32::new(0));
-        let result = with_initial_http_5xx_retry(|| {
+        let result = with_initial_status_retry(|| {
             let counter = Arc::clone(&counter);
             async move {
                 let attempt = counter.fetch_add(1, Ordering::SeqCst);
@@ -147,7 +147,7 @@ mod tests {
         tokio::time::pause();
 
         let counter = Arc::new(AtomicU32::new(0));
-        let result = with_initial_http_5xx_retry(|| {
+        let result = with_initial_status_retry(|| {
             let counter = Arc::clone(&counter);
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_initial_http_5xx_retry_does_not_retry_4xx() {
         let counter = Arc::new(AtomicU32::new(0));
-        let result = with_initial_http_5xx_retry(|| {
+        let result = with_initial_status_retry(|| {
             let counter = Arc::clone(&counter);
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -183,9 +183,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initial_http_5xx_retry_does_not_retry_rate_limit() {
+    async fn test_initial_status_retry_waits_out_a_rate_limit() {
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+
         let counter = Arc::new(AtomicU32::new(0));
-        let result = with_initial_http_5xx_retry(|| {
+        let result = with_initial_status_retry(|| {
+            let counter = Arc::clone(&counter);
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 {
+                    Err(ProviderError::RateLimited {
+                        retry_after_ms: 5000,
+                        body: None,
+                    })
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        // 5 s and 10 s of backoff, each plus under 2 s of jitter.
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(15) && waited < Duration::from_secs(19),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initial_status_retry_honours_a_longer_retry_after() {
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = with_initial_status_retry(|| {
+            let counter = Arc::clone(&counter);
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ProviderError::RateLimited {
+                        retry_after_ms: 40_000,
+                        body: None,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(started.elapsed() >= Duration::from_secs(40));
+    }
+
+    #[tokio::test]
+    async fn test_initial_status_retry_gives_up_after_the_rate_limit_budget() {
+        tokio::time::pause();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = with_initial_status_retry(|| {
             let counter = Arc::clone(&counter);
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -197,13 +256,26 @@ mod tests {
         })
         .await;
 
-        assert!(matches!(
-            result.unwrap_err(),
-            ProviderError::RateLimited {
-                retry_after_ms: 5000,
-                body: None,
+        assert!(matches!(result.unwrap_err(), ProviderError::RateLimited { .. }));
+        assert_eq!(counter.load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test]
+    async fn test_initial_status_retry_does_not_wait_on_an_exhausted_quota() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = with_initial_status_retry(|| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(ProviderError::RateLimited {
+                    retry_after_ms: 5000,
+                    body: Some(r#"{"error":{"code":"insufficient_quota","message":"quota"}}"#.into()),
+                })
             }
-        ));
+        })
+        .await;
+
+        assert!(matches!(result.unwrap_err(), ProviderError::RateLimited { .. }));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 

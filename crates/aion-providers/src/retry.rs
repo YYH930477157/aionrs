@@ -75,31 +75,84 @@ fn is_initial_connect_error(error: &ProviderError) -> bool {
     }
 }
 
-/// Retry transient provider-side HTTP failures before stream consumption starts.
-pub(crate) async fn with_initial_http_5xx_retry<F, Fut, T>(f: F) -> Result<T, ProviderError>
+/// Waits before retrying a rate-limited request. Several agents sharing one provider account
+/// (a team on one relay) exceed a requests-per-minute limit together; the limit clears within
+/// a minute or two, so failing the turn after the first 429 stops the whole team.
+const INITIAL_RATE_LIMIT_RETRY_BACKOFFS: [Duration; 6] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(60),
+];
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(120);
+
+/// Retry transient provider-side failures before stream consumption starts: HTTP 5xx
+/// responses, and rate limits other than an exhausted quota.
+pub(crate) async fn with_initial_status_retry<F, Fut, T>(f: F) -> Result<T, ProviderError>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
 {
-    let max_retries = INITIAL_HTTP_5XX_RETRY_BACKOFFS.len();
-    for (attempt, backoff) in INITIAL_HTTP_5XX_RETRY_BACKOFFS.iter().enumerate() {
-        match f().await {
+    let mut server_errors = 0;
+    let mut rate_limits = 0;
+    loop {
+        let error = match f().await {
             Ok(val) => return Ok(val),
-            Err(e) => match initial_http_5xx_status(&e) {
-                Some(status) => {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries,
-                        status,
-                        "retrying initial provider request after server error"
-                    );
-                    tokio::time::sleep(*backoff).await;
-                }
-                _ => return Err(e),
-            },
+            Err(error) => error,
+        };
+        if let Some(status) = initial_http_5xx_status(&error)
+            && let Some(backoff) = INITIAL_HTTP_5XX_RETRY_BACKOFFS.get(server_errors)
+        {
+            server_errors += 1;
+            tracing::warn!(
+                attempt = server_errors,
+                max_retries = INITIAL_HTTP_5XX_RETRY_BACKOFFS.len(),
+                status,
+                "retrying initial provider request after server error"
+            );
+            tokio::time::sleep(*backoff).await;
+            continue;
         }
+        if let Some(wait) = initial_rate_limit_wait(&error, rate_limits) {
+            rate_limits += 1;
+            tracing::warn!(
+                attempt = rate_limits,
+                max_retries = INITIAL_RATE_LIMIT_RETRY_BACKOFFS.len(),
+                wait_ms = wait.as_millis() as u64,
+                "retrying initial provider request after rate limit"
+            );
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        return Err(error);
     }
-    f().await
+}
+
+/// How long to wait before retry `attempt` of a rate-limited request, or `None` when it
+/// should fail now: the retries are used up, or the provider says the quota is exhausted.
+fn initial_rate_limit_wait(error: &ProviderError, attempt: usize) -> Option<Duration> {
+    let ProviderError::RateLimited { retry_after_ms, body } = error else {
+        return None;
+    };
+    if body.as_deref().is_some_and(|body| body.contains("insufficient_quota")) {
+        return None;
+    }
+    let backoff = INITIAL_RATE_LIMIT_RETRY_BACKOFFS.get(attempt)?;
+    let wait = (*backoff)
+        .max(Duration::from_millis(*retry_after_ms))
+        .min(MAX_RATE_LIMIT_WAIT);
+    Some(wait + retry_jitter())
+}
+
+/// Up to two seconds, so agents limited together do not retry in the same instant.
+fn retry_jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(u64::from(nanos % 2000))
 }
 
 fn initial_http_5xx_status(error: &ProviderError) -> Option<u16> {

@@ -334,7 +334,9 @@ async fn test_aio_140_anthropic_tools_wire_shape_mismatch_error_is_readable_and_
 // test_anthropic_rate_limit_retryable
 // ---------------------------------------------------------------------------
 
-/// A 429 response from the API should produce a ProviderError::RateLimited.
+/// A 429 response is retried after a wait, so a short rate limit does not fail the turn.
+/// (The mapping of a 429 to `ProviderError::RateLimited` with its body is covered by the
+/// transport and error unit tests.)
 #[tokio::test]
 async fn test_anthropic_rate_limit_retryable() {
     let server = MockServer::start().await;
@@ -346,6 +348,12 @@ async fn test_anthropic_rate_limit_retryable() {
                 r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}"#,
             ),
         )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(text_sse_body("ok"), "text/event-stream"))
         .mount(&server)
         .await;
 
@@ -356,18 +364,13 @@ async fn test_anthropic_rate_limit_retryable() {
     // Act
     let result = provider.stream(&request).await;
 
-    // Assert: RateLimited error, which is retryable
-    match result {
-        Err(ProviderError::RateLimited { retry_after_ms, body }) => {
-            assert!(retry_after_ms > 0, "retry_after_ms should be positive");
-            assert!(
-                body.as_deref().is_some_and(|b| b.contains("rate_limit_error")),
-                "429 body should be preserved, got: {body:?}",
-            );
-        }
-        Err(other) => panic!("expected RateLimited error, got: {other:?}"),
-        Ok(_) => panic!("expected an error but stream succeeded"),
-    }
+    // Assert: the stream opens on the second request
+    assert!(
+        result.is_ok(),
+        "the rate-limited request should be retried, got: {:?}",
+        result.err()
+    );
+    assert_eq!(server.received_requests().await.unwrap_or_default().len(), 2);
 }
 
 // ---------------------------------------------------------------------------

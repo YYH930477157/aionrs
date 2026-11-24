@@ -63,7 +63,7 @@ where
     };
 
     let response = if policy.initial_http_5xx {
-        crate::retry::with_initial_http_5xx_retry(send_initial).await?
+        crate::retry::with_initial_status_retry(send_initial).await?
     } else {
         send_initial().await?
     };
@@ -100,7 +100,7 @@ where
 
                     let resend = send.clone();
                     let resend_result = if policy.initial_http_5xx {
-                        crate::retry::with_initial_http_5xx_retry(resend).await
+                        crate::retry::with_initial_status_retry(resend).await
                     } else {
                         resend().await
                     };

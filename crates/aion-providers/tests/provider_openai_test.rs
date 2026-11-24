@@ -667,14 +667,16 @@ async fn test_aio_140_openai_tools_wire_shape_mismatch_error_is_readable_and_not
 // test_openai_rate_limited
 // ---------------------------------------------------------------------------
 
-/// Verify that a 429 response is surfaced as ProviderError::RateLimited.
+/// Verify that a 429 for an exhausted quota is surfaced at once as ProviderError::RateLimited:
+/// waiting cannot help it, unlike a requests-per-minute limit, which is retried.
 #[tokio::test]
 async fn test_openai_rate_limited() {
     let server = MockServer::start().await;
+    let quota = r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#;
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+        .respond_with(ResponseTemplate::new(429).set_body_string(quota))
         .mount(&server)
         .await;
 
@@ -685,10 +687,11 @@ async fn test_openai_rate_limited() {
     match result.unwrap_err() {
         aion_providers::ProviderError::RateLimited { retry_after_ms, body } => {
             assert_eq!(retry_after_ms, 5000);
-            assert_eq!(body.as_deref(), Some("Too Many Requests"));
+            assert_eq!(body.as_deref(), Some(quota));
         }
         e => panic!("expected RateLimited error, got: {:?}", e),
     }
+    assert_eq!(server.received_requests().await.unwrap_or_default().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
