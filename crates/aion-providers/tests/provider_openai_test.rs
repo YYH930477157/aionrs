@@ -694,6 +694,49 @@ async fn test_openai_rate_limited() {
     assert_eq!(server.received_requests().await.unwrap_or_default().len(), 1);
 }
 
+/// A requests-per-minute 429 (as a relay shared by a team returns it) is waited out: the
+/// stream opens on the retry and delivers the reply.
+#[tokio::test]
+async fn test_openai_rate_limit_recovers() {
+    let server = MockServer::start().await;
+    let chunk = json!({
+        "id": "chatcmpl-rl",
+        "object": "chat.completion.chunk",
+        "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 1 }
+    })
+    .to_string();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(build_sse_body(&[&chunk]), "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new("test-key", &server.uri(), ProviderCompat::openai_defaults());
+    let mut rx = provider
+        .stream(&make_request())
+        .await
+        .expect("the 429 should be retried");
+    let mut text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            LlmEvent::TextDelta(delta) => text.push_str(&delta),
+            LlmEvent::Error(error) => panic!("stream failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(text, "ok");
+    assert_eq!(server.received_requests().await.unwrap_or_default().len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // test_openai_stream_max_tokens_stop_reason
 // ---------------------------------------------------------------------------
