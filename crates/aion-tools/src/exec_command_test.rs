@@ -95,6 +95,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn python_writes_utf8_unless_an_encoding_was_chosen() {
+        let mut runtime = std::collections::HashMap::new();
+        assert_eq!(python_io_encoding(&runtime, false), Some("utf-8"));
+        // The user's own setting wins.
+        assert_eq!(python_io_encoding(&runtime, true), None);
+        runtime.insert("PYTHONIOENCODING".to_string(), "gbk".to_string());
+        assert_eq!(python_io_encoding(&runtime, false), None);
+    }
+
+    #[tokio::test]
+    async fn execute_gives_python_utf8_output_by_default() {
+        if std::env::var_os("PYTHONIOENCODING").is_some() {
+            return;
+        }
+        let tool = ExecCommandTool::new(std::env::temp_dir());
+        #[cfg(windows)]
+        let input = json!({"cmd": "Write-Output \"enc=$env:PYTHONIOENCODING\"", "shell": "powershell"});
+        #[cfg(not(windows))]
+        let input = json!({"cmd": "printf 'enc=%s' \"$PYTHONIOENCODING\"", "shell": "sh"});
+
+        let result = tool.execute(input).await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.contains("enc=utf-8"), "got: {}", result.content);
+    }
+
     #[tokio::test]
     async fn execute_injects_runtime_env() {
         let tool = ExecCommandTool::new_with_env(

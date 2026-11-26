@@ -16,6 +16,7 @@ use crate::workspace::{SharedWorkspaceContext, WorkspaceContext, snapshot};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+const PYTHON_IO_ENCODING: &str = "PYTHONIOENCODING";
 
 pub struct ExecCommandTool {
     workspace: SharedWorkspaceContext,
@@ -37,6 +38,14 @@ impl ExecCommandTool {
             runtime_env: runtime_env.into_iter().collect(),
         }
     }
+}
+
+/// The output is decoded as UTF-8, but Python writes the system code page to a pipe
+/// (GBK on a Chinese Windows), which turns every non-ASCII header or value into
+/// replacement characters. Ask Python for UTF-8 unless the runtime or the user chose
+/// an encoding.
+fn python_io_encoding(runtime_env: &HashMap<String, String>, inherited: bool) -> Option<&'static str> {
+    (!inherited && !runtime_env.contains_key(PYTHON_IO_ENCODING)).then_some("utf-8")
 }
 
 fn render_exit_result(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> String {
@@ -161,6 +170,9 @@ impl Tool for ExecCommandTool {
 
         let mut command_builder = shell_command_builder(&shell, command, false);
         command_builder.envs(&self.runtime_env).current_dir(&cwd);
+        if let Some(encoding) = python_io_encoding(&self.runtime_env, std::env::var_os(PYTHON_IO_ENCODING).is_some()) {
+            command_builder.env(PYTHON_IO_ENCODING, encoding);
+        }
 
         let result = CommandRunner::new(command_builder).timeout(timeout).run().await;
 
