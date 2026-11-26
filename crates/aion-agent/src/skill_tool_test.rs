@@ -273,6 +273,17 @@ mod supplemental_tests {
     }
 
     #[tokio::test]
+    async fn tc_13_3b_missing_skill_points_to_other_loading_instructions() {
+        // A host may list skills the tool does not hold; the model must not read
+        // the miss as "this skill does not exist".
+        let tool = tool_with(vec![make_skill("commit", "body")]);
+        let result = tool.execute(json!({"skill": "host-skill"})).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("not found in this tool"));
+        assert!(result.content.contains("load it the way they describe"));
+    }
+
+    #[tokio::test]
     async fn tc_13_4_fork_skill_returns_error() {
         let mut skill = make_skill("fork-skill", "body");
         skill.execution_context = ExecutionContext::Fork;

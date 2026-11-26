@@ -66,7 +66,8 @@ async fn bootstrap_registers_all_expected_tools() {
         assert!(names.iter().any(|n| n == expected), "missing built-in tool: {expected}");
     }
 
-    assert!(names.iter().any(|n| n == "Skill"), "SkillTool should be registered");
+    // SkillTool depends on the skills found on this machine; see
+    // `skill_tool_is_registered_only_when_there_are_skills`.
     assert!(names.iter().any(|n| n == "Spawn"), "SpawnTool should be registered");
     assert!(
         names.iter().any(|n| n == "ToolSearch"),

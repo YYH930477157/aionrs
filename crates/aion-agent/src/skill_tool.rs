@@ -140,9 +140,15 @@ impl Tool for SkillTool {
         let skill = match self.find_skill(skill_name) {
             Some(s) => s,
             None => {
-                let available = self.available_names();
+                // A host may list skills of its own that load another way. A bare
+                // "not found" made models report that such a skill does not exist.
                 return ToolResult {
-                    content: format!("Skill '{}' not found. Available skills: {}", skill_name, available),
+                    content: format!(
+                        "Skill '{}' not found in this tool. Skills this tool can invoke: {}. \
+                         If your instructions list this skill elsewhere, load it the way they describe.",
+                        skill_name,
+                        self.available_names()
+                    ),
                     is_error: true,
                 };
             }

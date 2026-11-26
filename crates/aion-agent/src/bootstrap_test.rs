@@ -104,6 +104,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_tool_is_registered_only_when_there_are_skills() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let empty_root = tempfile::TempDir::new().unwrap();
+        let skill_root = tempfile::TempDir::new().unwrap();
+        write_skill(skill_root.path(), "with-skill");
+        let mut config = test_config();
+        config.mcp.servers.clear();
+
+        let build = |root: std::path::PathBuf| {
+            let output: Arc<dyn OutputSink> = Arc::new(NullSink);
+            AgentBootstrap::new(config.clone(), workspace.path().to_string_lossy(), output)
+                .isolated_skill_dirs(vec![root])
+                .build()
+        };
+
+        // A host that injects its own skill list leaves this agent with none; an
+        // empty Skill tool would only answer "not found" for the host's skills.
+        let mut without = build(empty_root.path().to_path_buf()).await.unwrap();
+        assert!(without.engine.registry_mut().get("Skill").is_none());
+
+        let mut with = build(skill_root.path().to_path_buf()).await.unwrap();
+        assert!(with.engine.registry_mut().get("Skill").is_some());
+    }
+
+    #[tokio::test]
     async fn workspace_update_changes_registered_tools_and_model_context() {
         let initial = tempfile::tempdir().unwrap();
         let next = tempfile::tempdir().unwrap();

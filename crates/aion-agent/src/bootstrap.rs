@@ -348,11 +348,15 @@ impl AgentBootstrap {
             self.config.tools.skills.allow.clone(),
             self.config.tools.auto_approve,
         );
-        registry.register(Box::new(SkillTool::new(
-            Arc::new(skills),
-            self.workspace.to_path_buf(),
-            skill_checker,
-        )));
+        // With nothing to invoke, the tool only answers "not found", which models
+        // took as proof that skills a host lists in its prompt do not exist.
+        if !skills.is_empty() {
+            registry.register(Box::new(SkillTool::new(
+                Arc::new(skills),
+                self.workspace.to_path_buf(),
+                skill_checker,
+            )));
+        }
 
         let mut spawner = AgentSpawner::new_with_env(
             Arc::clone(provider),
