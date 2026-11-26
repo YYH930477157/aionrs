@@ -87,6 +87,44 @@ impl WorkspaceContext {
         Ok(path)
     }
 
+    /// Explains why a recursive search rooted at `root` is refused, or `None` when it is fine.
+    ///
+    /// A recursive Glob or Grep at a folder that contains the workspace, at a drive root or
+    /// at the user's home folder walks other projects and the user's own files: slow, and
+    /// rarely what the task needs. A folder beside the workspace stays searchable.
+    pub(crate) fn broad_search_refusal(&self, root: &Path) -> Option<String> {
+        let root = root.canonicalize().ok()?;
+        let workspace: Vec<PathBuf> = self
+            .default_cwd
+            .iter()
+            .chain(self.roots.iter().filter(|r| r.available).map(|r| &r.path))
+            .filter_map(|path| path.canonicalize().ok())
+            .collect();
+        if workspace.contains(&root) {
+            return None;
+        }
+        let reason = if let Some(inner) = workspace.iter().find(|path| path.starts_with(&root)) {
+            format!(
+                "every folder around the workspace '{}', which it contains",
+                inner.display()
+            )
+        } else if root.parent().is_none() {
+            "a whole drive".to_string()
+        } else if home_folder().is_some_and(|home| home == root) {
+            "the user's whole home folder".to_string()
+        } else {
+            return None;
+        };
+        let inside = self.default_cwd.as_ref().map_or_else(
+            || "a project folder".to_string(),
+            |cwd| format!("the workspace ('{}')", cwd.display()),
+        );
+        Some(format!(
+            "Refused: a recursive search of '{}' would scan {reason}. Search inside {inside}, or name the specific folder you need.",
+            root.display()
+        ))
+    }
+
     pub(crate) fn execution_label(&self, cwd: &Path) -> String {
         let actual = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let root = self
@@ -104,6 +142,13 @@ impl WorkspaceContext {
         }
         label
     }
+}
+
+fn home_folder() -> Option<PathBuf> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .and_then(|path| path.canonicalize().ok())
 }
 
 pub(crate) fn snapshot(workspace: &SharedWorkspaceContext) -> Result<WorkspaceContext, String> {

@@ -39,6 +39,7 @@ impl Tool for GrepTool {
          - Uses Rust regex syntax (e.g., \"log.*Error\", \"fn\\\\s+\\\\w+\", \"foo|bar\"); \
          look-around and backreferences are not supported.\n\
          - Searches folders recursively, honours .gitignore, and skips hidden and binary files.\n\
+         - A folder that contains the workspace, a drive root or the home folder is refused; name a narrower folder.\n\
          - Use the glob parameter to filter by file pattern (e.g., \"*.rs\" or \"*.{c,h}\").\n\
          - Output is truncated to 250 lines.\n\
          - Set case_insensitive to true for case-insensitive search."
@@ -99,6 +100,15 @@ impl Tool for GrepTool {
                 };
             }
         };
+
+        if root.is_dir()
+            && let Some(refusal) = workspace.broad_search_refusal(&root)
+        {
+            return ToolResult {
+                content: refusal,
+                is_error: true,
+            };
+        }
 
         tracing::debug!(resolved_path = %root.display(), "GrepTool searching");
 

@@ -96,6 +96,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn brace_alternatives_match_each_extension_under_a_non_ascii_folder() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("需求");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("list.xlsx"), "x").unwrap();
+        fs::write(folder.join("list.csv"), "c").unwrap();
+        fs::write(folder.join("notes.txt"), "t").unwrap();
+
+        let result = run_glob("**/*.{xlsx,xls,csv}", dir.path().to_str().unwrap()).await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("list.xlsx"), "got: {}", result.content);
+        assert!(result.content.contains("list.csv"), "got: {}", result.content);
+        assert!(!result.content.contains("notes.txt"), "got: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn the_newest_files_survive_the_limit_and_the_cut_is_reported() {
+        let dir = tempdir().unwrap();
+        let early = dir.path().join("a");
+        let late = dir.path().join("z");
+        fs::create_dir_all(&early).unwrap();
+        fs::create_dir_all(&late).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        for i in 0..MAX_RESULTS + 1 {
+            let path = early.join(format!("old_{i:03}.txt"));
+            fs::write(&path, "old").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        // Walked last, but the newest: it must head the list.
+        fs::write(late.join("newest.txt"), "new").unwrap();
+
+        let result = run_glob("**/*.txt", dir.path().to_str().unwrap()).await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.lines().next().unwrap().ends_with("newest.txt"),
+            "got: {}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("(Showing the 100 newest of 102 matching files."),
+            "got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recursive_search_above_the_workspace_is_refused_but_a_sibling_is_not() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        let sibling = dir.path().join("notes");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(dir.path().join("answer.txt"), "secret").unwrap();
+        fs::write(sibling.join("plan.txt"), "plan").unwrap();
+        let tool = GlobTool::new(workspace.clone());
+
+        let above = tool
+            .execute(json!({"pattern": "**/*.txt", "path": dir.path().to_str().unwrap()}))
+            .await;
+        assert!(above.is_error, "got: {}", above.content);
+        assert!(above.content.starts_with("Refused:"), "got: {}", above.content);
+        assert!(!above.content.contains("answer.txt"));
+
+        let absolute = format!("{}/**/*.txt", dir.path().display());
+        let absolute = tool.execute(json!({"pattern": absolute})).await;
+        assert!(absolute.is_error, "got: {}", absolute.content);
+
+        let one_level = tool
+            .execute(json!({"pattern": "*.txt", "path": dir.path().to_str().unwrap()}))
+            .await;
+        assert!(!one_level.is_error, "got: {}", one_level.content);
+
+        let beside = tool
+            .execute(json!({"pattern": "**/*.txt", "path": sibling.to_str().unwrap()}))
+            .await;
+        assert!(!beside.is_error, "got: {}", beside.content);
+        assert!(beside.content.contains("plan.txt"));
+    }
+
+    #[test]
+    fn braces_expand_nested_and_repeated_groups_and_leave_single_items_alone() {
+        assert_eq!(expand_braces("x{a,{b,c}}y"), vec!["xay", "xby", "xcy"]);
+        assert_eq!(
+            expand_braces("s/*.{c,h}/{p,q}"),
+            vec!["s/*.c/p", "s/*.c/q", "s/*.h/p", "s/*.h/q"]
+        );
+        assert_eq!(expand_braces("only{one}.rs"), vec!["only{one}.rs"]);
+        assert_eq!(expand_braces("open{a,b"), vec!["open{a,b"]);
+        assert_eq!(expand_braces("**/*.rs"), vec!["**/*.rs"]);
+    }
+
+    #[tokio::test]
     async fn execute_uses_cwd_for_relative_path() {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("marker.txt"), "hello").unwrap();

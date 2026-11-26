@@ -18,6 +18,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_folder_that_contains_the_workspace_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(tmp.path().join("answer.txt"), "needle").unwrap();
+        std::fs::write(workspace.join("code.c"), "needle").unwrap();
+        let tool = GrepTool::new(workspace.clone());
+
+        let above = tool
+            .execute(json!({"pattern": "needle", "path": tmp.path().to_str().unwrap()}))
+            .await;
+        assert!(above.is_error, "got: {}", above.content);
+        assert!(above.content.starts_with("Refused:"), "got: {}", above.content);
+
+        let file = tool
+            .execute(json!({"pattern": "needle", "path": tmp.path().join("answer.txt").to_str().unwrap()}))
+            .await;
+        assert!(!file.is_error, "a single named file stays readable: {}", file.content);
+
+        let inside = tool.execute(json!({"pattern": "needle"})).await;
+        assert!(!inside.is_error, "got: {}", inside.content);
+        assert!(inside.content.contains("code.c"));
+    }
+
+    #[tokio::test]
     async fn execute_uses_cwd_for_relative_path() {
         use std::fs;
         let tmp = tempfile::tempdir().unwrap();
